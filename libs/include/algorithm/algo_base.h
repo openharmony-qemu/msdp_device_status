@@ -18,6 +18,7 @@
 
 #ifdef DEVICE_STATUS_SENSOR_ENABLE
 #include <cmath>
+#include <memory>
 #include <cstdio>
 #include <iostream>
 
@@ -30,7 +31,7 @@
 namespace OHOS {
 namespace Msdp {
 namespace DeviceStatus {
-class AlgoBase {
+class AlgoBase : public std::enable_shared_from_this<AlgoBase> {
 public:
     AlgoBase() {};
     virtual ~AlgoBase() = default;

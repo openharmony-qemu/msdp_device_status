@@ -17,6 +17,7 @@
 #define DEVICESTATUS_MANAGER_H
 
 #include <set>
+#include <memory>
 #include <map>
 
 #include <atomic>
@@ -42,16 +43,18 @@ namespace DeviceStatus {
 using namespace Security::AccessToken;
 using namespace OHOS::Rosen;
 class DeviceStatusService;
-class DeviceStatusManager {
+class DeviceStatusManager : public std::enable_shared_from_this<DeviceStatusManager> {
 public:
     DeviceStatusManager() = default;
-    ~DeviceStatusManager() = default;
+    ~DeviceStatusManager();
 
     class DeviceStatusCallbackDeathRecipient : public IRemoteObject::DeathRecipient {
     public:
-        DeviceStatusCallbackDeathRecipient() = default;
+        explicit DeviceStatusCallbackDeathRecipient(std::weak_ptr<DeviceStatusManager> manager) : manager_(manager) {}
         virtual void OnRemoteDied(const wptr<IRemoteObject> &remote);
         virtual ~DeviceStatusCallbackDeathRecipient() = default;
+    private:
+        std::weak_ptr<DeviceStatusManager> manager_;
     };
 
     class BoomerangCallbackDeathRecipient : public IRemoteObject::DeathRecipient {
@@ -133,9 +136,11 @@ private:
     void HandlerPageScrollerEvent(int32_t event);
     void SystemBarHiddedInit();
 #endif
+    void ReconcileType(Type type);
+    void RemoveDeadCallback(const wptr<IRemoteObject>& remote);
+    bool HasObjectLocked(const sptr<IRemoteObject>& object) const;
     void TimerTask();
     void RemoveLibTimerTask(const std::shared_ptr<BoomerangAlgoImpl> &boomerangAlgo);
-    static constexpr int32_t argSize_ { TYPE_MAX };
 
     std::mutex mutex_;
     sptr<IRemoteObject::DeathRecipient> devicestatusCBDeathRecipient_ { nullptr };
@@ -143,16 +148,17 @@ private:
     std::shared_ptr<DeviceStatusMsdpClientImpl> msdpImpl_ { nullptr };
     std::map<Type, OnChangedValue> msdpData_;
     std::map<Type, std::set<const sptr<IRemoteDevStaCallback>, classcomp>> listeners_;
+    std::map<Type, std::map<sptr<IRemoteDevStaCallback>, ActivityEvent, classcomp>> listenerEvents_;
+    std::set<Type> enabledTypes_;
+    std::set<Type> changingTypes_;
+    std::set<Type> failedStopTypes_;
     std::map<std::string, std::set<const sptr<IRemoteBoomerangCallback>, boomerangClasscomp>> boomerangListeners_;
     sptr<IRemoteBoomerangCallback> notifyListener_ { nullptr };
     sptr<IRemoteBoomerangCallback> encodeCallback_ { nullptr };
     std::map<sptr<IRemoteBoomerangCallback>, std::string> bundleNameCache_;
     sptr<AppExecFwk::IBundleMgr> bundleManager_ { nullptr };
     std::shared_ptr<BoomerangAlgoImpl> boomerangAlgo_;
-    int32_t type_ { -1 };
     int32_t boomerangType_ { -1 };
-    int32_t event_ { -1 };
-    int32_t arrs_[argSize_] {};
 #ifdef BOOMERANG_ONESTEP
     bool isAccessibilityInit_ = false;
     std::atomic<bool> lastEnable_ { true };

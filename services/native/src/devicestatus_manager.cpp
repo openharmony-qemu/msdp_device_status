@@ -52,8 +52,8 @@ std::mutex DeviceStatusManager::g_mutex_;
 
 void DeviceStatusManager::DeviceStatusCallbackDeathRecipient::OnRemoteDied(const wptr<IRemoteObject>& remote)
 {
-    CHKPV(remote);
-    FI_HILOGI("Recv death notice");
+    auto manager = manager_.lock();
+    if (manager != nullptr) { manager->RemoveDeadCallback(remote); }
 }
 
 void DeviceStatusManager::BoomerangCallbackDeathRecipient::OnRemoteDied(const wptr<IRemoteObject>& remote)
@@ -154,7 +154,7 @@ bool DeviceStatusManager::Init()
 {
     CALL_DEBUG_ENTER;
     if (devicestatusCBDeathRecipient_ == nullptr) {
-        devicestatusCBDeathRecipient_ = new (std::nothrow) DeviceStatusCallbackDeathRecipient();
+        devicestatusCBDeathRecipient_ = new (std::nothrow) DeviceStatusCallbackDeathRecipient(weak_from_this());
         if (devicestatusCBDeathRecipient_ == nullptr) {
             FI_HILOGE("devicestatusCBDeathRecipient_ failed");
             return false;
@@ -211,16 +211,8 @@ Data DeviceStatusManager::GetLatestDeviceStatusData(Type type)
 
 bool DeviceStatusManager::Enable(Type type)
 {
-    CALL_DEBUG_ENTER;
-    if ((type <= TYPE_INVALID) || (type >= TYPE_MAX)) {
-        FI_HILOGE("Check type is invalid");
-        return false;
-    }
-    if (!InitAlgoMngrInterface(type)) {
-        FI_HILOGE("Init AlgoMngr Interface error");
-        return false;
-    }
-    return InitDataCallback();
+    if (type <= TYPE_INVALID || type >= TYPE_MAX || !InitDataCallback()) { return false; }
+    return InitAlgoMngrInterface(type);
 }
 
 bool DeviceStatusManager::Disable(Type type)
@@ -250,15 +242,14 @@ bool DeviceStatusManager::InitAlgoMngrInterface(Type type)
 
 bool DeviceStatusManager::InitDataCallback()
 {
-    CALL_DEBUG_ENTER;
     CHKPF(msdpImpl_);
-    DeviceStatusMsdpClientImpl::CallbackManager callback = [this](const Data &data) {
-        return this->MsdpDataCallback(data);
+    auto owner = weak_from_this();
+    if (owner.expired()) { return false; }
+    DeviceStatusMsdpClientImpl::CallbackManager callback = [owner](const Data &data) {
+        auto manager = owner.lock();
+        return manager != nullptr ? manager->MsdpDataCallback(data) : RET_ERR;
     };
-    if (msdpImpl_->RegisterImpl(callback) == RET_ERR) {
-        FI_HILOGE("Register impl failed");
-    }
-    return true;
+    return msdpImpl_->RegisterImpl(callback) == RET_OK;
 }
 
 int32_t DeviceStatusManager::MsdpDataCallback(const Data &data)
@@ -269,47 +260,26 @@ int32_t DeviceStatusManager::MsdpDataCallback(const Data &data)
 
 int32_t DeviceStatusManager::NotifyDeviceStatusChange(const Data &deviceStatusData)
 {
-    CALL_DEBUG_ENTER;
-    FI_HILOGI("type:%{public}d, value:%{public}d", deviceStatusData.type, deviceStatusData.value);
-    std::set<const sptr<IRemoteDevStaCallback>, classcomp> listeners;
-    std::lock_guard lock(mutex_);
-    auto iter = listeners_.find(deviceStatusData.type);
-    if (iter == listeners_.end()) {
-        FI_HILOGE("type:%{public}d is not exits", deviceStatusData.type);
-        return RET_ERR;
+    if (deviceStatusData.type <= TYPE_INVALID || deviceStatusData.type >= TYPE_MAX) { return RET_ERR; }
+    std::map<sptr<IRemoteDevStaCallback>, ActivityEvent, classcomp> listeners;
+    {
+        std::lock_guard lock(mutex_);
+        auto found = listenerEvents_.find(deviceStatusData.type);
+        if (found == listenerEvents_.end()) { return RET_ERR; }
+        listeners = found->second;
     }
-    if ((deviceStatusData.type <= TYPE_INVALID) || (deviceStatusData.type >= TYPE_MAX)) {
-        FI_HILOGE("Check deviceStatusData.type is invalid");
-        return RET_ERR;
-    }
-    listeners = (std::set<const sptr<IRemoteDevStaCallback>, classcomp>)(iter->second);
-    for (const auto &listener : listeners) {
-        if (listener == nullptr) {
-            FI_HILOGE("listener is nullptr");
-            return RET_ERR;
+    // An individual listener's requested event is preserved; no global last-event alias.
+    for (const auto& entry : listeners) {
+        bool current = false;
+        {
+            std::lock_guard lock(mutex_);
+            auto found = listenerEvents_.find(deviceStatusData.type);
+            current = found != listenerEvents_.end() && found->second.count(entry.first) != 0;
         }
-        FI_HILOGI("type:%{public}d, arrs_:%{public}d", deviceStatusData.type, arrs_[deviceStatusData.type]);
-        switch (arrs_[deviceStatusData.type]) {
-            case ENTER: {
-                if (deviceStatusData.value == VALUE_ENTER) {
-                    listener->OnDeviceStatusChanged(deviceStatusData);
-                }
-                break;
-            }
-            case EXIT: {
-                if (deviceStatusData.value == VALUE_EXIT) {
-                    listener->OnDeviceStatusChanged(deviceStatusData);
-                }
-                break;
-            }
-            case ENTER_EXIT: {
-                listener->OnDeviceStatusChanged(deviceStatusData);
-                break;
-            }
-            default: {
-                FI_HILOGE("OnChangedValue is unknown");
-                return RET_ERR;
-            }
+        if (!current) { continue; }
+        if (entry.second == ENTER_EXIT || (entry.second == ENTER && deviceStatusData.value == VALUE_ENTER) ||
+            (entry.second == EXIT && deviceStatusData.value == VALUE_EXIT)) {
+            entry.first->OnDeviceStatusChanged(deviceStatusData);
         }
     }
     return RET_OK;
@@ -318,94 +288,131 @@ int32_t DeviceStatusManager::NotifyDeviceStatusChange(const Data &deviceStatusDa
 void DeviceStatusManager::Subscribe(Type type, ActivityEvent event, ReportLatencyNs latency,
     sptr<IRemoteDevStaCallback> callback)
 {
-    CALL_DEBUG_ENTER;
-    CHKPV(callback);
-    if ((type <= TYPE_INVALID) || (type >= TYPE_MAX)) {
-        FI_HILOGE("Subscribe type_:%{public}d is error", type_);
-        return;
-    }
-    if ((event < ENTER) || (event > ENTER_EXIT)) {
-        FI_HILOGE("Subscribe event_:%{public}d is error", event_);
-        return;
-    }
-    std::lock_guard lock(mutex_);
-    event_ = event;
-    type_ = type;
-    if (argSize_ < type_ + 1) {
-        FI_HILOGE("Subscribe type is error");
-        return;
-    }
-    arrs_ [type_] = event_;
-    FI_HILOGI("type_:%{public}d, event:%{public}d", type_, event);
-    std::set<const sptr<IRemoteDevStaCallback>, classcomp> listeners;
+    (void)latency;
+    if (callback == nullptr || type <= TYPE_INVALID || type >= TYPE_MAX || event < ENTER || event > ENTER_EXIT) { return; }
     auto object = callback->AsObject();
-    CHKPV(object);
-    FI_HILOGI("listeners_.size:%{public}zu", listeners_.size());
-    auto dtTypeIter = listeners_.find(type);
-    if (dtTypeIter == listeners_.end()) {
-        if (listeners.insert(callback).second) {
-            FI_HILOGI("No found set list of type, insert success");
-            object->AddDeathRecipient(devicestatusCBDeathRecipient_);
-        }
-        auto [_, ret] = listeners_.insert(std::make_pair(type, listeners));
-        if (!ret) {
-            FI_HILOGW("type is duplicated");
-        }
-    } else {
-        FI_HILOGI("callbacklist.size:%{public}zu", listeners_[dtTypeIter->first].size());
-        auto iter = listeners_[dtTypeIter->first].find(callback);
-        if (iter != listeners_[dtTypeIter->first].end()) {
+    if (object == nullptr) { return; }
+    {
+        std::lock_guard lock(mutex_);
+        auto found = listeners_.find(type);
+        if (found != listeners_.end() && found->second.count(callback) != 0) { return; }
+        if (!HasObjectLocked(object) && !object->AddDeathRecipient(devicestatusCBDeathRecipient_)) {
+            FI_HILOGE("Failed to register actual subscriber death recipient");
             return;
         }
-        if (listeners_[dtTypeIter->first].insert(callback).second) {
-            FI_HILOGI("Find set list of type, insert success");
-            object->AddDeathRecipient(devicestatusCBDeathRecipient_);
-        }
+        listeners_[type].insert(callback);
+        listenerEvents_[type][callback] = event;
     }
-    if (!Enable(type)) {
-        FI_HILOGE("Enable failed");
-        return;
-    }
+    ReconcileType(type);
 }
 
 void DeviceStatusManager::Unsubscribe(Type type, ActivityEvent event, sptr<IRemoteDevStaCallback> callback)
 {
-    CALL_DEBUG_ENTER;
-    CHKPV(callback);
-    if ((type <= TYPE_INVALID) || (type >= TYPE_MAX)) {
-        FI_HILOGE("Unsubscribe type_:%{public}d is error", type);
-        return;
-    }
-    if ((event < ENTER) || (event > ENTER_EXIT)) {
-        FI_HILOGE("Unsubscribe event_:%{public}d is error", event);
-        return;
-    }
+    if (callback == nullptr || type <= TYPE_INVALID || type >= TYPE_MAX || event < ENTER || event > ENTER_EXIT) { return; }
     auto object = callback->AsObject();
-    CHKPV(object);
-    std::lock_guard lock(mutex_);
-    FI_HILOGI("listeners_.size:%{public}zu, type:%{public}d event:%{public}d", listeners_.size(),
-        static_cast<int32_t>(type), event);
-    auto dtTypeIter = listeners_.find(type);
-    if (dtTypeIter == listeners_.end()) {
-        FI_HILOGE("Failed to find listener for type");
-        return;
+    if (object == nullptr) { return; }
+    {
+        std::lock_guard lock(mutex_);
+        auto found = listeners_.find(type);
+        if (found == listeners_.end() || found->second.erase(callback) == 0) { return; }
+        auto events = listenerEvents_.find(type);
+        if (events != listenerEvents_.end()) {
+            events->second.erase(callback);
+            if (events->second.empty()) { listenerEvents_.erase(events); }
+        }
+        if (found->second.empty()) { listeners_.erase(found); }
+        if (!HasObjectLocked(object)) { object->RemoveDeathRecipient(devicestatusCBDeathRecipient_); }
     }
-    FI_HILOGI("callbacklist.size:%{public}zu", listeners_[dtTypeIter->first].size());
-    auto iter = listeners_[dtTypeIter->first].find(callback);
-    if (iter != listeners_[dtTypeIter->first].end()) {
-        if (listeners_[dtTypeIter->first].erase(callback) != 0) {
-            object->RemoveDeathRecipient(devicestatusCBDeathRecipient_);
-            if (listeners_[dtTypeIter->first].empty()) {
-                listeners_.erase(dtTypeIter);
+    ReconcileType(type);
+}
+
+bool DeviceStatusManager::HasObjectLocked(const sptr<IRemoteObject>& object) const
+{
+    for (const auto& type : listeners_) {
+        for (const auto& listener : type.second) { if (listener->AsObject() == object) { return true; } }
+    }
+    return false;
+}
+
+void DeviceStatusManager::ReconcileType(Type type)
+{
+    for (;;) {
+        bool start = false;
+        {
+            std::lock_guard lock(mutex_);
+            if (changingTypes_.count(type) != 0) { return; }
+            auto found = listeners_.find(type);
+            bool wanted = found != listeners_.end() && !found->second.empty();
+            bool enabled = enabledTypes_.count(type) != 0;
+            if (failedStopTypes_.count(type) != 0) { wanted = false; }
+            if (wanted == enabled) { return; }
+            start = wanted;
+            changingTypes_.insert(type);
+        }
+        // Neither backend operations nor user callback paths run under mutex_.
+        bool success = start ? Enable(type) : Disable(type);
+        {
+            std::lock_guard lock(mutex_);
+            changingTypes_.erase(type);
+            if (!success) {
+                if (!start) { failedStopTypes_.insert(type); }
+                auto found = listeners_.find(type);
+                decltype(listeners_)::mapped_type failed;
+                if (found != listeners_.end()) { failed.swap(found->second); listeners_.erase(found); }
+                listenerEvents_.erase(type);
+                for (const auto& callback : failed) {
+                    auto object = callback->AsObject();
+                    if (object != nullptr && !HasObjectLocked(object)) { object->RemoveDeathRecipient(devicestatusCBDeathRecipient_); }
+                }
+                FI_HILOGE("Real backend transition failed; pending subscription rolled back");
+                return;
             }
+            if (start) { enabledTypes_.insert(type); }
+            else { enabledTypes_.erase(type); failedStopTypes_.erase(type); }
+        }
+        // on/off/death may have changed the desired state during the real call.
+    }
+}
+
+void DeviceStatusManager::RemoveDeadCallback(const wptr<IRemoteObject>& remote)
+{
+    auto object = remote.promote();
+    if (object == nullptr) { return; }
+    std::set<Type> changed;
+    {
+        std::lock_guard lock(mutex_);
+        for (auto it = listeners_.begin(); it != listeners_.end();) {
+            auto& callbacks = it->second;
+            for (auto callback = callbacks.begin(); callback != callbacks.end();) {
+                if ((*callback)->AsObject() == object) {
+                    listenerEvents_[it->first].erase(*callback);
+                    callback = callbacks.erase(callback);
+                    changed.insert(it->first);
+                } else { ++callback; }
+            }
+            if (callbacks.empty()) { listenerEvents_.erase(it->first); it = listeners_.erase(it); }
+            else { ++it; }
         }
     }
-    FI_HILOGI("listeners_.size:%{public}zu", listeners_.size());
-    if (listeners_.empty()) {
-        Disable(type);
-    } else {
-        FI_HILOGI("Other subscribe exist");
+    for (auto type : changed) { ReconcileType(type); }
+}
+
+DeviceStatusManager::~DeviceStatusManager()
+{
+    std::set<Type> enabled;
+    {
+        std::lock_guard lock(mutex_);
+        enabled.swap(enabledTypes_);
+        for (const auto& type : listeners_) {
+            for (const auto& callback : type.second) {
+                auto object = callback->AsObject();
+                if (object != nullptr) { object->RemoveDeathRecipient(devicestatusCBDeathRecipient_); }
+            }
+        }
+        listeners_.clear();
+        listenerEvents_.clear();
     }
+    for (auto type : enabled) { Disable(type); }
 }
 
 int32_t DeviceStatusManager::Subscribe(int32_t type, const std::string &bundleName,

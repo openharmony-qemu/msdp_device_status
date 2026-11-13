@@ -30,6 +30,7 @@ public:
     bool Init(Type type) override;
 
 private:
+    Type reportType_ { TYPE_INVALID };
     bool StartAlgorithm(int32_t sensorTypeId, AccelData* sensorData) override;
     void ExecuteOperation() override;
 };

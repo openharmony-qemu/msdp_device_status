@@ -18,6 +18,7 @@
 
 #ifdef DEVICE_STATUS_SENSOR_ENABLE
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -49,8 +50,8 @@ public:
     ErrCode UnregisterSensor(Type type);
     std::shared_ptr<MsdpAlgoCallback> GetCallbackImpl()
     {
-        std::unique_lock lock(mutex_);
-        return callback_;
+        std::unique_lock lock(mutex_, std::try_to_lock);
+        return lock.owns_lock() ? callback_ : nullptr;
     }
     bool CheckSensorTypeId(int32_t sensorTypeId);
     bool StartSensor(Type type);
@@ -59,11 +60,13 @@ private:
     int32_t type_[Type::TYPE_MAX] { 0 };
     std::shared_ptr<MsdpAlgoCallback> callback_ { nullptr };
     std::mutex mutex_;
+    std::shared_ptr<AlgoAbsoluteStill> publicStill_ { nullptr };
+    std::set<Type> stoppingTypes_;
+    std::set<Type> quiescedTypes_;
     std::shared_ptr<AlgoAbsoluteStill> still_ { nullptr };
     std::shared_ptr<AlgoHorizontal> horizontalPosition_ { nullptr };
     std::shared_ptr<AlgoVertical> verticalPosition_ { nullptr };
     std::map<Type, int32_t> callAlgoNums_ {};
-    Type algoType_ { TYPE_INVALID };
 };
 } // namespace DeviceStatus
 } // namespace Msdp

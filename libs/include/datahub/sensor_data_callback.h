@@ -18,12 +18,15 @@
 
 #ifdef DEVICE_STATUS_SENSOR_ENABLE
 #include <atomic>
+#include <condition_variable>
+#include <memory>
+#include <vector>
+#include <cstdint>
 #include <list>
 #include <map>
 #include <mutex>
 #include <thread>
 
-#include "semaphore.h"
 #include "singleton.h"
 #include "sensor_agent.h"
 #include "sensor_agent_type.h"
@@ -40,26 +43,42 @@ public:
     bool UnregisterCallbackSensor(int32_t sensorTypeId);
     void Init();
     bool Unregister();
-    bool SubscribeSensorEvent(int32_t sensorTypeId, SensorCallback callback);
+    bool SubscribeSensorEvent(int32_t sensorTypeId, SensorCallback callback, std::shared_ptr<void> owner = nullptr);
     bool UnsubscribeSensorEvent(int32_t sensorTypeId, SensorCallback callback);
     bool PushData(int32_t sensorTypeId, uint8_t* data);
 
 private:
-    bool PopData(int32_t sensorTypeId, AccelData& data);
+    struct Sample { uint64_t sequence; AccelData data; };
+    struct Slot {
+        SensorCallback callback;
+        std::shared_ptr<void> owner;
+        uint64_t firstSequence { 0 };
+        bool active { true };
+        size_t inFlight { 0 };
+        std::condition_variable drained;
+    };
+    bool PopData(int32_t sensorTypeId, AccelData& data, uint64_t& sequence);
     void AlgorithmLoop();
     void HandleSensorEvent();
-    bool NotifyCallback(int32_t sensorTypeId, AccelData* data);
+    bool NotifyCallback(int32_t sensorTypeId, AccelData* data, uint64_t sequence);
+    bool StopPhysicalLocked();
 
-    struct SensorUser user_ = {.name = {0}, .callback = nullptr, .userData = nullptr};
-    std::list<AccelData> accelDataList_;
+    struct SensorUser user_ {};
+    std::list<Sample> accelDataList_;
     std::unique_ptr<std::thread> algorithmThread_ { nullptr };
-    sem_t sem_ = {};
+    std::condition_variable dataReady_;
     std::mutex callbackMutex_;
     std::mutex dataMutex_;
     std::mutex initMutex_;
     std::mutex sensorMutex_;
-    std::atomic<bool> alive_ { true };
-    std::map<int32_t, SensorCallback> algoMap_;
+    std::atomic<bool> alive_ { false };
+    bool workerStopping_ { false };
+    bool accepting_ { false };
+    bool subscribed_ { false };
+    bool activated_ { false };
+    size_t physicalUsers_ { 0 };
+    uint64_t sampleSequence_ { 0 };
+    std::map<int32_t, std::shared_ptr<Slot>> algoMap_;
 };
 #define SENSOR_DATA_CB OHOS::Singleton<SensorDataCallback>::GetInstance()
 } // namespace DeviceStatus

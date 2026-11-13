@@ -44,7 +44,6 @@ using ClientValue = OnChangedValue;
 DeviceStatusMsdpClientImpl::DeviceStatusMsdpClientImpl()
 {
     for (int32_t type = 0; type < static_cast<int32_t>(Type::TYPE_MAX); ++type) {
-        algoCallCounts_[static_cast<Type>(type)] = 0;
         mockCallCounts_[static_cast<Type>(type)] = 0;
     }
 }
@@ -64,10 +63,14 @@ ErrCode DeviceStatusMsdpClientImpl::InitMsdpImpl(Type type)
     #else
     FI_HILOGE("Enable:sensor is not exist");
     #endif // DEVICE_STATUS_SENSOR_ENABLE
+#ifndef DEVICE_STATUS_DISABLE_MOCK_FALLBACK
     if (MockHandle(type) == RET_OK) {
         FI_HILOGI("MockHandle is support");
         return RET_OK;
     }
+#else
+    FI_HILOGE("No real sensor backend supports this type; mock fallback is disabled");
+#endif
     return RET_ERR;
 }
 
@@ -101,32 +104,21 @@ ErrCode DeviceStatusMsdpClientImpl::MockHandle(Type type)
 
 ErrCode DeviceStatusMsdpClientImpl::AlgoHandle(Type type)
 {
-    if (GetAlgoAbility(type) == RET_ERR) {
-        FI_HILOGE("Algo Library is not support");
+    if (algoRetiring_) { return RET_ERR; }
+    std::unique_lock lifecycle(algoLifecycleMutex_, std::try_to_lock);
+    if (!lifecycle.owns_lock() || algoRetiring_ || GetAlgoAbility(type) != RET_OK) { return RET_ERR; }
+    auto existing = algoCallCounts_.find(type);
+    if (existing != algoCallCounts_.end()) {
+        if (existing->second == UINT32_MAX) { return RET_ERR; }
+        ++existing->second;
+        return RET_OK;
+    }
+    if (weak_from_this().expired() || StartAlgo(type) != RET_OK || iAlgo_ == nullptr) { return RET_ERR; }
+    if (RegisterAlgo() != RET_OK || iAlgo_->Enable(type) != RET_OK) {
+        if (algoCallCounts_.empty()) { UnloadAlgoLibraryLocked(); }
         return RET_ERR;
     }
-    if (StartAlgo(type) == RET_ERR) {
-        FI_HILOGE("Start algo Library failed");
-        return RET_ERR;
-    }
-    CHKPR(iAlgo_, RET_ERR);
-    if ((iAlgo_->Enable(type)) == RET_ERR) {
-        FI_HILOGE("Enable algo Library failed");
-        return RET_ERR;
-    }
-    std::unique_lock lock(mutex_);
-    auto iter = algoCallCounts_.find(type);
-    if (iter == algoCallCounts_.end()) {
-        auto ret = algoCallCounts_.emplace(type, 0);
-        if (!ret.second) {
-            FI_HILOGW("Type is duplicated");
-            return RET_ERR;
-        }
-    } else {
-        iter->second++;
-    }
-    RegisterAlgo();
-    FI_HILOGI("algoCallCounts_:%{public}d", algoCallCounts_[type]);
+    algoCallCounts_.emplace(type, 1);
     return RET_OK;
 }
 
@@ -136,7 +128,7 @@ ErrCode DeviceStatusMsdpClientImpl::StartAlgo(Type type)
         FI_HILOGE("Load algo Library failed");
         return RET_ERR;
     }
-    std::unique_lock lock(mutex_);
+    // GetAlgoInst owns mutex_; do not recursively lock the same std::mutex.
     iAlgo_ = GetAlgoInst(type);
     CHKPR(iAlgo_, RET_ERR);
     return RET_OK;
@@ -164,7 +156,7 @@ ErrCode DeviceStatusMsdpClientImpl::GetSensorHdi(Type type)
 
 ErrCode DeviceStatusMsdpClientImpl::GetAlgoAbility(Type type)
 {
-    if ((type == Type::TYPE_ABSOLUTE_STILL) || (type == Type::TYPE_HORIZONTAL_POSITION) ||
+    if ((type == Type::TYPE_STILL) || (type == Type::TYPE_ABSOLUTE_STILL) || (type == Type::TYPE_HORIZONTAL_POSITION) ||
         (type == Type::TYPE_VERTICAL_POSITION)) {
         FI_HILOGI("Support ability type:%{public}d", type);
         return RET_OK;
@@ -187,36 +179,27 @@ ErrCode DeviceStatusMsdpClientImpl::SensorHdiDisable(Type type)
 
 ErrCode DeviceStatusMsdpClientImpl::AlgoDisable(Type type)
 {
-    #ifdef DEVICE_STATUS_SENSOR_ENABLE
-    CALL_DEBUG_ENTER;
-    CHKPR(iAlgo_, RET_ERR);
-    auto iter = algoCallCounts_.find(type);
-    if (iter == algoCallCounts_.end()) {
-        FI_HILOGE("Failed to find record type");
-        return RET_ERR;
-    }
-    if (iter->second == 0) {
-        algoCallCounts_.erase(type);
-    } else {
-        iAlgo_->Disable(type);
-        UnregisterAlgo();
-    }
-    algoCallCounts_.erase(type);
+#ifdef DEVICE_STATUS_SENSOR_ENABLE
+    if (algoRetiring_) { return RET_ERR; }
+    std::unique_lock lifecycle(algoLifecycleMutex_, std::try_to_lock);
+    if (!lifecycle.owns_lock() || algoRetiring_ || iAlgo_ == nullptr) { return RET_ERR; }
+    auto found = algoCallCounts_.find(type);
+    if (found == algoCallCounts_.end()) { return RET_ERR; }
+    if (found->second > 1) { --found->second; return RET_OK; }
+    auto self = weak_from_this().lock();
+    if (self == nullptr || iAlgo_->Disable(type) != RET_OK) { return RET_ERR; }
+    algoCallCounts_.erase(found);
     if (algoCallCounts_.empty()) {
-        if (UnloadAlgoLibrary() == RET_ERR) {
-            FI_HILOGE("Failed to close algorithm library");
-            return RET_ERR;
-        }
-        FI_HILOGI("Close algorithm library");
-        iAlgo_ = nullptr;
-        callBacksMgr_ = nullptr;
+        algoRetiring_ = true;
+        // This code is in the service DSO, not the algorithm being retired.
+        // It waits for the actual worker's join after any reentrant callback returns.
+        std::thread([self] { self->RetireAlgo(); }).detach();
     }
-    FI_HILOGI("algoCallCounts_:%{public}d", algoCallCounts_[type]);
     return RET_OK;
-    #else
-    FI_HILOGE("Disable:sensor is not exist");
+#else
+    (void)type;
     return RET_ERR;
-    #endif // DEVICE_STATUS_SENSOR_ENABLE
+#endif
 }
 
 ErrCode DeviceStatusMsdpClientImpl::MockDisable(Type type)
@@ -250,14 +233,15 @@ ErrCode DeviceStatusMsdpClientImpl::MockDisable(Type type)
 
 ErrCode DeviceStatusMsdpClientImpl::ImplCallback(const Data &data)
 {
-    std::unique_lock lock(mutex_);
-    CHKPR(callBacksMgr_, RET_ERR);
-    callBacksMgr_(data);
-    return RET_OK;
+    CallbackManager callback;
+    { std::lock_guard lock(callMutex_); callback = callBacksMgr_; }
+    return callback ? callback(data) : RET_ERR;
 }
 
 ErrCode DeviceStatusMsdpClientImpl::RegisterImpl(const CallbackManager &callback)
 {
+    if (!callback) { return RET_ERR; }
+    std::lock_guard lock(callMutex_);
     callBacksMgr_ = callback;
     return RET_OK;
 }
@@ -288,12 +272,10 @@ ErrCode DeviceStatusMsdpClientImpl::UnregisterMock()
 
 ErrCode DeviceStatusMsdpClientImpl::RegisterAlgo()
 {
-    CALL_DEBUG_ENTER;
-    if (iAlgo_ != nullptr) {
-        std::shared_ptr<IMsdp::MsdpAlgoCallback> callback_ = shared_from_this();
-        iAlgo_->RegisterCallback(callback_);
-    }
-    return RET_OK;
+    if (iAlgo_ == nullptr) { return RET_ERR; }
+    auto self = weak_from_this().lock();
+    if (self == nullptr) { return RET_ERR; }
+    return iAlgo_->RegisterCallback(self);
 }
 
 ErrCode DeviceStatusMsdpClientImpl::UnregisterAlgo()
@@ -306,33 +288,15 @@ ErrCode DeviceStatusMsdpClientImpl::UnregisterAlgo()
 
 int32_t DeviceStatusMsdpClientImpl::MsdpCallback(const Data &data)
 {
-    CALL_DEBUG_ENTER;
-    std::unique_lock callLock(callMutex_);
     DS_DUMPER->PushDeviceStatus(data);
     SaveObserverData(data);
-    if (notifyManagerFlag_) {
-        ImplCallback(data);
-        notifyManagerFlag_ = false;
-    }
-    return RET_OK;
+    return ImplCallback(data);
 }
 
 Data DeviceStatusMsdpClientImpl::SaveObserverData(const Data &data)
 {
-    CALL_DEBUG_ENTER;
-    for (auto iter = deviceStatusDatas_.begin(); iter != deviceStatusDatas_.end(); ++iter) {
-        if (iter->first == data.type) {
-            iter->second = data.value;
-            notifyManagerFlag_ = true;
-            return data;
-        }
-    }
-    auto ret = deviceStatusDatas_.insert(std::make_pair(data.type, data.value));
-    if (!ret.second) {
-        FI_HILOGW("type is duplicated");
-        return data;
-    }
-    notifyManagerFlag_ = true;
+    std::lock_guard lock(callMutex_);
+    deviceStatusDatas_[data.type] = data.value;
     return data;
 }
 
@@ -445,9 +409,6 @@ ErrCode DeviceStatusMsdpClientImpl::LoadAlgoLibrary()
             dlName.c_str());
         dlclose(algo_.handle);
         algo_.Clear();
-        if (algo_.handle == nullptr) {
-            return RET_OK;
-        }
         FI_HILOGE("Load algo failed");
         return RET_ERR;
     }
@@ -456,14 +417,35 @@ ErrCode DeviceStatusMsdpClientImpl::LoadAlgoLibrary()
 
 ErrCode DeviceStatusMsdpClientImpl::UnloadAlgoLibrary()
 {
-    CALL_DEBUG_ENTER;
+    std::unique_lock lifecycle(algoLifecycleMutex_, std::try_to_lock);
+    if (!lifecycle.owns_lock()) { return RET_ERR; }
+    return UnloadAlgoLibraryLocked();
+}
+
+void DeviceStatusMsdpClientImpl::RetireAlgo()
+{
+    std::lock_guard lifecycle(algoLifecycleMutex_);
+    if (UnloadAlgoLibraryLocked() != RET_OK) {
+        FI_HILOGE("Algorithm teardown incomplete; retaining mapped module");
+    }
+    algoRetiring_ = false;
+}
+
+ErrCode DeviceStatusMsdpClientImpl::UnloadAlgoLibraryLocked()
+{
+    if (!algoCallCounts_.empty()) { return RET_ERR; }
+    if (iAlgo_ != nullptr) {
+        if (iAlgo_->DisableCount(TYPE_INVALID) != RET_OK) { return RET_ERR; }
+        if (iAlgo_->UnregisterCallback() != RET_OK) { return RET_ERR; }
+    }
     std::unique_lock lock(mutex_);
-    CHKPR(algo_.handle, RET_ERR);
+    if (algo_.handle == nullptr) { return RET_OK; }
     if (algo_.pAlgorithm != nullptr) {
         algo_.destroy(algo_.pAlgorithm);
         algo_.pAlgorithm = nullptr;
     }
-    dlclose(algo_.handle);
+    iAlgo_ = nullptr;
+    if (dlclose(algo_.handle) != 0) { return RET_ERR; }
     algo_.Clear();
     return RET_OK;
 }
@@ -471,6 +453,7 @@ ErrCode DeviceStatusMsdpClientImpl::UnloadAlgoLibrary()
 IMsdp* DeviceStatusMsdpClientImpl::GetAlgoInst(Type type)
 {
     CALL_DEBUG_ENTER;
+    (void)type;
     std::unique_lock lock(mutex_);
     CHKPP(algo_.handle);
     if (algo_.pAlgorithm == nullptr) {

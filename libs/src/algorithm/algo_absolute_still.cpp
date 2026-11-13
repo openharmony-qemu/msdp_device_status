@@ -28,6 +28,8 @@ namespace DeviceStatus {
 bool AlgoAbsoluteStill::Init(Type type)
 {
     CALL_DEBUG_ENTER;
+    if (type != TYPE_ABSOLUTE_STILL && type != TYPE_STILL) { return false; }
+    reportType_ = type;
     algoCallback_ = [this](int32_t sensorTypeId, AccelData* sensorData) {
         return this->StartAlgorithm(sensorTypeId, sensorData);
     };
@@ -35,8 +37,9 @@ bool AlgoAbsoluteStill::Init(Type type)
         FI_HILOGE("algoCallback is nullptr");
         return false;
     }
-    SENSOR_DATA_CB.SubscribeSensorEvent(type, algoCallback_);
-    return true;
+    auto owner = weak_from_this().lock();
+    if (owner == nullptr) { return false; }
+    return SENSOR_DATA_CB.SubscribeSensorEvent(type, algoCallback_, owner);
 }
 
 bool AlgoAbsoluteStill::StartAlgorithm(int32_t sensorTypeId, AccelData* sensorData)
@@ -63,14 +66,14 @@ void AlgoAbsoluteStill::ExecuteOperation()
         counter_--;
         if (counter_ == 0) {
             counter_ = COUNTER_THRESHOLD;
-            UpdateStateAndReport(VALUE_ENTER, STILL, TYPE_ABSOLUTE_STILL);
+            UpdateStateAndReport(VALUE_ENTER, STILL, reportType_);
         }
     } else {
         counter_ = COUNTER_THRESHOLD;
         if (state_ == UNSTILL) {
             return;
         }
-        UpdateStateAndReport(VALUE_EXIT, UNSTILL, TYPE_ABSOLUTE_STILL);
+        UpdateStateAndReport(VALUE_EXIT, UNSTILL, reportType_);
     }
 }
 } // namespace DeviceStatus

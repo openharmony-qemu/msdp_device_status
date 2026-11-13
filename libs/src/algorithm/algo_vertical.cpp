@@ -35,8 +35,9 @@ bool AlgoVertical::Init(Type type)
         return this->StartAlgorithm(sensorTypeId, sensorData);
     };
     CHKPF(algoCallback_);
-    SENSOR_DATA_CB.SubscribeSensorEvent(type, algoCallback_);
-    return true;
+    auto owner = weak_from_this().lock();
+    if (owner == nullptr) { return false; }
+    return SENSOR_DATA_CB.SubscribeSensorEvent(type, algoCallback_, owner);
 }
 
 bool AlgoVertical::StartAlgorithm(int32_t sensorTypeId, AccelData* sensorData)

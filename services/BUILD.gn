@@ -157,6 +157,9 @@ ohos_shared_library("devicestatus_service") {
   }
 
   defines = []
+  if (!device_status_allow_mock_fallback) {
+    defines += [ "DEVICE_STATUS_DISABLE_MOCK_FALLBACK" ]
+  }
   external_deps = external_deps_set
   if (device_status_sensor_enable) {
     defines += [ "DEVICE_STATUS_SENSOR_ENABLE" ]
@@ -227,6 +230,9 @@ ohos_static_library("devicestatus_static_service") {
   }
 
   defines = []
+  if (!device_status_allow_mock_fallback) {
+    defines += [ "DEVICE_STATUS_DISABLE_MOCK_FALLBACK" ]
+  }
   external_deps = external_deps_set
   if (device_status_sensor_enable) {
     defines += [ "DEVICE_STATUS_SENSOR_ENABLE" ]

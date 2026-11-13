@@ -17,6 +17,8 @@
 #define DEVICESTATUS_MSDP_CLIENT_IMPL_H
 
 #include <memory>
+#include <atomic>
+#include <thread>
 #include <mutex>
 #include <map>
 
@@ -31,7 +33,7 @@ class DeviceStatusMsdpClientImpl : public IMsdp::MsdpAlgoCallback,
 public:
     using CallbackManager = std::function<int32_t(const Data&)>;
     using LoadMockLibraryFunc = IMsdp* (*)();
-    using LoadMockLibraryPtr = void *(*)(IMsdp*);
+    using LoadMockLibraryPtr = void (*)(const IMsdp*);
     DeviceStatusMsdpClientImpl();
     ErrCode InitMsdpImpl(Type type);
     ErrCode Disable(Type type);
@@ -62,6 +64,8 @@ public:
 
 private:
     ErrCode ImplCallback(const Data &data);
+    ErrCode UnloadAlgoLibraryLocked();
+    void RetireAlgo();
     IMsdp* GetAlgoInst(Type type);
     IMsdp* GetMockInst(Type type);
     void OnResult(const Data &data) override;
@@ -77,7 +81,8 @@ private:
     IMsdp* iAlgo_ { nullptr };
     IMsdp* iMock_ { nullptr };
     std::mutex mutex_;
-    bool notifyManagerFlag_ { false };
+    std::mutex algoLifecycleMutex_;
+    std::atomic<bool> algoRetiring_ { false };
     mutable std::mutex callMutex_;
 };
 } // namespace DeviceStatus

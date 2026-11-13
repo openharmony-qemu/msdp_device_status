@@ -46,7 +46,7 @@ public:
 struct MsdpAlgoHandle {
     void* handle;
     IMsdp* (*create)();
-    void* (*destroy)(IMsdp*);
+    void (*destroy)(const IMsdp*);
     IMsdp* pAlgorithm;
     MsdpAlgoHandle() : handle(nullptr), create(nullptr), destroy(nullptr), pAlgorithm(nullptr) {}
     ~MsdpAlgoHandle() {}

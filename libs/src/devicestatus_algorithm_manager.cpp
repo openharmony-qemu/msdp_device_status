@@ -15,6 +15,7 @@
 
 #ifdef DEVICE_STATUS_SENSOR_ENABLE
 #include "devicestatus_algorithm_manager.h"
+#include <climits>
 
 #include <cerrno>
 #include <string>
@@ -58,38 +59,19 @@ bool AlgoMgr::StartSensor(Type type)
 
 ErrCode AlgoMgr::RegisterCallback(std::shared_ptr<MsdpAlgoCallback> callback)
 {
-    CALL_DEBUG_ENTER;
-    std::lock_guard lock(mutex_);
-    switch (algoType_) {
-        case Type::TYPE_ABSOLUTE_STILL: {
-            if (still_ != nullptr) {
-                still_->RegisterCallback(callback);
-            }
-            break;
-        }
-        case Type::TYPE_HORIZONTAL_POSITION: {
-            if (horizontalPosition_ != nullptr) {
-                horizontalPosition_->RegisterCallback(callback);
-            }
-            break;
-        }
-        case Type::TYPE_VERTICAL_POSITION: {
-            if (verticalPosition_ != nullptr) {
-                verticalPosition_->RegisterCallback(callback);
-            }
-            break;
-        }
-        default: {
-            FI_HILOGE("Unsupported algorithm type");
-            return RET_ERR;
-        }
-    }
+    if (callback == nullptr) { return RET_ERR; }
+    std::unique_lock lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) { return RET_ERR; }
+    if (!callAlgoNums_.empty() && callback_ != callback) { return RET_ERR; }
+    callback_ = std::move(callback);
     return RET_OK;
 }
 
 ErrCode AlgoMgr::UnregisterCallback()
 {
-    CALL_DEBUG_ENTER;
+    std::unique_lock lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock() || !callAlgoNums_.empty()) { return RET_ERR; }
+    callback_.reset();
     return RET_OK;
 }
 
@@ -117,6 +99,7 @@ int32_t AlgoMgr::GetSensorTypeId(Type type)
 {
     FI_HILOGI("Get sensor type: %{public}d", type);
     switch (type) {
+        case Type::TYPE_STILL:
         case Type::TYPE_ABSOLUTE_STILL: {
             return SensorTypeId::SENSOR_TYPE_ID_ACCELEROMETER;
         }
@@ -136,116 +119,84 @@ int32_t AlgoMgr::GetSensorTypeId(Type type)
 
 ErrCode AlgoMgr::Enable(Type type)
 {
-    CALL_DEBUG_ENTER;
-    if (!StartSensor(type)) {
-        FI_HILOGE("sensor init failed");
-        return RET_ERR;
+    std::unique_lock lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock() || callback_ == nullptr || stoppingTypes_.count(type) != 0) { return RET_ERR; }
+    auto existing = callAlgoNums_.find(type);
+    if (existing != callAlgoNums_.end()) {
+        if (existing->second == INT32_MAX) { return RET_ERR; }
+        ++existing->second;
+        return RET_OK;
     }
-    std::lock_guard lock(mutex_);
+    if (GetSensorTypeId(type) == RET_ERR || !StartSensor(type)) { return RET_ERR; }
+    std::shared_ptr<AlgoBase> instance;
     switch (type) {
-        case Type::TYPE_ABSOLUTE_STILL: {
-            if (still_ == nullptr) {
-                FI_HILOGE("still_ is nullptr");
-                still_ = std::make_shared<AlgoAbsoluteStill>();
-                still_->Init(type);
-                callAlgoNums_[type] = 0;
-            }
-            callAlgoNums_[type]++;
-            break;
-        }
-        case Type::TYPE_HORIZONTAL_POSITION: {
-            if (horizontalPosition_ == nullptr) {
-                FI_HILOGE("horizontalPosition_ is nullptr");
-                horizontalPosition_ = std::make_shared<AlgoHorizontal>();
-                horizontalPosition_->Init(type);
-                callAlgoNums_[type] = 0;
-            }
-            callAlgoNums_[type]++;
-            break;
-        }
-        case Type::TYPE_VERTICAL_POSITION: {
-            if (verticalPosition_ == nullptr) {
-                FI_HILOGE("verticalPosition_ is nullptr");
-                verticalPosition_ = std::make_shared<AlgoVertical>();
-                verticalPosition_->Init(type);
-                callAlgoNums_[type] = 0;
-            }
-            callAlgoNums_[type]++;
-            break;
-        }
-        default: {
-            FI_HILOGE("Unsupported algorithm type");
-            return RET_ERR;
-        }
+        case TYPE_STILL: instance = std::make_shared<AlgoAbsoluteStill>(); break;
+        case TYPE_ABSOLUTE_STILL: instance = std::make_shared<AlgoAbsoluteStill>(); break;
+        case TYPE_HORIZONTAL_POSITION: instance = std::make_shared<AlgoHorizontal>(); break;
+        case TYPE_VERTICAL_POSITION: instance = std::make_shared<AlgoVertical>(); break;
+        default: UnregisterSensor(type); return RET_ERR;
     }
-    algoType_ = type;
+    instance->RegisterCallback(callback_);
+    if (!instance->Init(type)) { UnregisterSensor(type); return RET_ERR; }
+    switch (type) {
+        case TYPE_STILL: publicStill_ = std::static_pointer_cast<AlgoAbsoluteStill>(instance); break;
+        case TYPE_ABSOLUTE_STILL: still_ = std::static_pointer_cast<AlgoAbsoluteStill>(instance); break;
+        case TYPE_HORIZONTAL_POSITION: horizontalPosition_ = std::static_pointer_cast<AlgoHorizontal>(instance); break;
+        case TYPE_VERTICAL_POSITION: verticalPosition_ = std::static_pointer_cast<AlgoVertical>(instance); break;
+        default: return RET_ERR;
+    }
+    callAlgoNums_[type] = 1;
     return RET_OK;
 }
 
 ErrCode AlgoMgr::Disable(Type type)
 {
-    CALL_DEBUG_ENTER;
-    std::lock_guard lock(mutex_);
-    callAlgoNums_[type]--;
-    FI_HILOGI("callAlgoNums_:%{public}d", callAlgoNums_[type]);
-    if (callAlgoNums_[type] != 0) {
-        FI_HILOGE("callAlgoNums_[type] is not zero");
-        return RET_ERR;
-    }
+    std::unique_lock lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) { return RET_ERR; }
+    auto found = callAlgoNums_.find(type);
+    if (found == callAlgoNums_.end()) { return RET_ERR; }
+    if (found->second > 1) { --found->second; return RET_OK; }
+    std::shared_ptr<AlgoBase> instance;
     switch (type) {
-        case Type::TYPE_ABSOLUTE_STILL: {
-            if (still_ != nullptr) {
-                FI_HILOGD("still_ is not nullptr");
-                still_->Unsubscribe(type);
-                still_ = nullptr;
-            }
-            break;
-        }
-        case Type::TYPE_HORIZONTAL_POSITION: {
-            if (horizontalPosition_ != nullptr) {
-                FI_HILOGD("horizontalPosition_ is not nullptr");
-                horizontalPosition_->Unsubscribe(type);
-                horizontalPosition_ = nullptr;
-            }
-            break;
-        }
-        case Type::TYPE_VERTICAL_POSITION: {
-            if (verticalPosition_ != nullptr) {
-                FI_HILOGD("verticalPosition_ is not nullptr");
-                verticalPosition_->Unsubscribe(type);
-                verticalPosition_ = nullptr;
-            }
-            break;
-        }
-        default: {
-            FI_HILOGE("Unsupported algorithm type");
-            break;
-        }
+        case TYPE_STILL: instance = publicStill_; break;
+        case TYPE_ABSOLUTE_STILL: instance = still_; break;
+        case TYPE_HORIZONTAL_POSITION: instance = horizontalPosition_; break;
+        case TYPE_VERTICAL_POSITION: instance = verticalPosition_; break;
+        default: return RET_ERR;
     }
-    callAlgoNums_.erase(type);
-    UnregisterSensor(type);
+    stoppingTypes_.insert(type);
+    if (instance != nullptr && quiescedTypes_.count(type) == 0) {
+        if (!SENSOR_DATA_CB.UnsubscribeSensorEvent(type, nullptr)) { return RET_ERR; }
+        quiescedTypes_.insert(type);
+    }
+    // Failed physical teardown remains retryable; never claim it was stopped.
+    if (UnregisterSensor(type) != RET_OK) { return RET_ERR; }
+    switch (type) {
+        case TYPE_STILL: publicStill_.reset(); break;
+        case TYPE_ABSOLUTE_STILL: still_.reset(); break;
+        case TYPE_HORIZONTAL_POSITION: horizontalPosition_.reset(); break;
+        case TYPE_VERTICAL_POSITION: verticalPosition_.reset(); break;
+        default: return RET_ERR;
+    }
+    stoppingTypes_.erase(type);
+    quiescedTypes_.erase(type);
+    callAlgoNums_.erase(found);
     return RET_OK;
 }
 
 ErrCode AlgoMgr::DisableCount(Type type)
 {
-    CALL_DEBUG_ENTER;
-    return RET_OK;
+    (void)type;
+    { std::lock_guard lock(mutex_); if (!callAlgoNums_.empty()) { return RET_ERR; } }
+    // Called by the service-side retirement worker, outside provider callbacks.
+    return SENSOR_DATA_CB.Unregister() ? RET_OK : RET_ERR;
 }
 
 ErrCode AlgoMgr::UnregisterSensor(Type type)
 {
-    CALL_DEBUG_ENTER;
     int32_t sensorType = GetSensorTypeId(type);
-    if (sensorType == RET_ERR) {
-        FI_HILOGE("Failed to get sensorType");
-        return false;
-    }
-    if (!SENSOR_DATA_CB.UnregisterCallbackSensor(sensorType)) {
-        FI_HILOGE("Failed to unregister callback sensor");
-        return false;
-    }
-    return true;
+    if (sensorType == RET_ERR) { return RET_ERR; }
+    return SENSOR_DATA_CB.UnregisterCallbackSensor(sensorType) ? RET_OK : RET_ERR;
 }
 
 extern "C" IMsdp *Create(void)

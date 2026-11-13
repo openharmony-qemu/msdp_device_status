@@ -25,6 +25,7 @@ declare_args() {
   device_status_hitrace_enable = false
   device_status_udmf_enabled = false
   device_status_sensor_enable = true
+  device_status_allow_mock_fallback = true
   device_status_memmgr_enable = false
   device_status_enable_universal_drag = false
   device_status_enable_internal_drop_animation = false
